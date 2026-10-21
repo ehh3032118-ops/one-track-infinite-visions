@@ -166,6 +166,20 @@ export interface CommunityPost {
   likes: number;
   comments: number;
   views?: number;
+  createdAt?: string;
+}
+
+export interface CommunityComment {
+  id: string;
+  postId: string;
+  author: {
+    name: string;
+    avatarUrl?: string;
+    role?: string;
+  };
+  text: string;
+  timeAgo: string;
+  createdAt: string;
 }
 
 export type MarketCategory = "전체" | "텍스처/브러시" | "템플릿" | "3D";

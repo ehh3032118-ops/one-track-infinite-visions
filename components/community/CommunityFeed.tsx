@@ -1,13 +1,23 @@
 "use client";
 
-import React, { useState, useMemo } from "react";
+import React, { useState, useMemo, useEffect, useCallback } from "react";
 import Image from "next/image";
-import { Search, Heart, MessageSquare, Eye, Filter } from "lucide-react";
+import { Search, Heart, MessageSquare, Eye, Filter, Send, User } from "lucide-react";
 import { CommunityCategory, CommunityPost } from "@/types";
+
+interface CommentItem {
+  id?: string;
+  author: string;
+  avatarUrl?: string;
+  role?: string;
+  text: string;
+  time: string;
+}
 
 interface CommunityFeedProps {
   posts: CommunityPost[];
   activeCategory: CommunityCategory;
+  onPostUpdated?: () => void;
 }
 
 type SortType = "latest" | "popular";
@@ -15,49 +25,151 @@ type SortType = "latest" | "popular";
 export default function CommunityFeed({
   posts,
   activeCategory,
+  onPostUpdated,
 }: CommunityFeedProps) {
   const [selectedSort, setSelectedSort] = useState<SortType>("latest");
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [likedPosts, setLikedPosts] = useState<Record<string, boolean>>({});
+  const [likesCountDelta, setLikesCountDelta] = useState<Record<string, number>>({});
   const [openComments, setOpenComments] = useState<Record<string, boolean>>({});
   const [newCommentText, setNewCommentText] = useState<Record<string, string>>({});
-  const [commentsMap, setCommentsMap] = useState<Record<string, { author: string; text: string; time: string }[]>>({
+  const [loadingComments, setLoadingComments] = useState<Record<string, boolean>>({});
+  const [submittingComment, setSubmittingComment] = useState<Record<string, boolean>>({});
+  const [commentAuthorName, setCommentAuthorName] = useState<string>("");
+
+  const [commentsMap, setCommentsMap] = useState<Record<string, CommentItem[]>>({
     "post-1": [
-      { author: "Studio 37", text: "신스 아르페지오가 고조되는 02:14 부근에 비주얼 글리치를 과감하게 넣는 걸 추천드려요!", time: "1시간 전" },
-      { author: "Chloe J.", text: "색감을 네온 라임과 딥 블루로 대비시키면 사운드 질감이 극대화될 것 같습니다.", time: "30분 전" },
+      {
+        author: "Studio 37",
+        text: "신스 아르페지오가 고조되는 02:14 부근에 비주얼 글리치를 과감하게 넣는 걸 추천드려요!",
+        time: "1시간 전",
+        avatarUrl:
+          "https://images.unsplash.com/photo-1570295999919-56ceb5ecca61?auto=format&fit=crop&w=200&q=80",
+      },
+      {
+        author: "Chloe J.",
+        text: "색감을 네온 라임과 딥 블루로 대비시키면 사운드 질감이 극대화될 것 같습니다.",
+        time: "30분 전",
+        avatarUrl:
+          "https://images.unsplash.com/photo-1514525253161-7a46d19cd819?auto=format&fit=crop&w=200&q=80",
+      },
     ],
   });
 
-  const toggleLike = (postId: string) => {
-    setLikedPosts((prev) => ({
-      ...prev,
-      [postId]: !prev[postId],
-    }));
+  // Load saved nickname from localStorage if available
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const saved = localStorage.getItem("onetrack_nickname");
+      if (saved) {
+        setCommentAuthorName(saved);
+      }
+    }
+  }, []);
+
+  const fetchPostComments = useCallback(async (postId: string) => {
+    try {
+      setLoadingComments((prev) => ({ ...prev, [postId]: true }));
+      const res = await fetch(`/api/community/comments?postId=${postId}`);
+      const data = await res.json();
+      if (data.success && Array.isArray(data.comments)) {
+        setCommentsMap((prev) => ({
+          ...prev,
+          [postId]: data.comments.map((c: { author?: { name?: string; avatarUrl?: string }; text: string; timeAgo?: string }) => ({
+            id: c.timeAgo,
+            author: c.author?.name || "익명 크리에이터",
+            avatarUrl: c.author?.avatarUrl,
+            text: c.text,
+            time: c.timeAgo || "방금 전",
+          })),
+        }));
+      }
+    } catch (e) {
+      console.warn("Failed to fetch comments for post:", postId, e);
+    } finally {
+      setLoadingComments((prev) => ({ ...prev, [postId]: false }));
+    }
+  }, []);
+
+  const toggleComments = async (postId: string) => {
+    const nextState = !openComments[postId];
+    setOpenComments((prev) => ({ ...prev, [postId]: nextState }));
+
+    // Fetch fresh comments from server when opening
+    if (nextState) {
+      await fetchPostComments(postId);
+    }
   };
 
-  const toggleComments = (postId: string) => {
-    setOpenComments((prev) => ({
+  const toggleLike = async (postId: string) => {
+    const isCurrentlyLiked = likedPosts[postId];
+    setLikedPosts((prev) => ({ ...prev, [postId]: !isCurrentlyLiked }));
+    setLikesCountDelta((prev) => ({
       ...prev,
-      [postId]: !prev[postId],
+      [postId]: (prev[postId] || 0) + (isCurrentlyLiked ? -1 : 1),
     }));
+
+    // Post to API
+    try {
+      await fetch("/api/community/likes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ postId }),
+      });
+    } catch (e) {
+      console.warn("Failed to sync like:", e);
+    }
   };
 
-  const handleAddComment = (postId: string) => {
+  const handleAddComment = async (postId: string) => {
     const text = newCommentText[postId]?.trim();
     if (!text) return;
 
+    const authorName = commentAuthorName.trim() || "방문자 크리에이터";
+    if (typeof window !== "undefined" && commentAuthorName.trim()) {
+      localStorage.setItem("onetrack_nickname", commentAuthorName.trim());
+    }
+
+    // Optimistic UI update
+    const optimisticComment: CommentItem = {
+      author: authorName,
+      text,
+      time: "방금 전",
+      avatarUrl:
+        "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=200&q=80",
+    };
+
     setCommentsMap((prev) => ({
       ...prev,
-      [postId]: [
-        ...(prev[postId] || []),
-        { author: "ME", text, time: "방금 전" },
-      ],
+      [postId]: [...(prev[postId] || []), optimisticComment],
     }));
 
-    setNewCommentText((prev) => ({
-      ...prev,
-      [postId]: "",
-    }));
+    setNewCommentText((prev) => ({ ...prev, [postId]: "" }));
+    setSubmittingComment((prev) => ({ ...prev, [postId]: true }));
+
+    try {
+      const res = await fetch("/api/community/comments", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          postId,
+          text,
+          author: {
+            name: authorName,
+            avatarUrl: optimisticComment.avatarUrl,
+            role: "Creator Visitor",
+          },
+        }),
+      });
+
+      const data = await res.json();
+      if (data.success && onPostUpdated) {
+        onPostUpdated();
+      }
+    } catch (e) {
+      console.error("Failed to post comment:", e);
+    } finally {
+      setSubmittingComment((prev) => ({ ...prev, [postId]: false }));
+    }
   };
 
   // Filter & Search & Sort
@@ -153,10 +265,11 @@ export default function CommunityFeed({
         <div className="space-y-4">
           {filteredPosts.map((post) => {
             const isLiked = likedPosts[post.id];
-            const currentLikes = post.likes + (isLiked ? 1 : 0);
+            const currentLikes = post.likes + (likesCountDelta[post.id] || 0);
             const postComments = commentsMap[post.id] || [];
-            const totalComments = post.comments + postComments.length;
+            const totalComments = Math.max(post.comments, postComments.length);
             const isCommentBoxOpen = openComments[post.id];
+            const isLoadingThisComments = loadingComments[post.id];
 
             return (
               <article
@@ -166,7 +279,7 @@ export default function CommunityFeed({
                 {/* Author Info & Category Badge */}
                 <div className="flex items-center justify-between gap-3">
                   <div className="flex items-center gap-3">
-                    <div className="relative w-10 h-10 rounded-full overflow-hidden border border-white/15">
+                    <div className="relative w-10 h-10 rounded-full overflow-hidden border border-white/15 bg-black/40">
                       <Image
                         src={post.author.avatarUrl}
                         alt={post.author.name}
@@ -287,47 +400,107 @@ export default function CommunityFeed({
                 {/* Expandable Comments Drawer */}
                 {isCommentBoxOpen && (
                   <div className="pt-4 border-t border-white/10 space-y-3 animate-fadeIn">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-mono font-bold text-zinc-400 flex items-center gap-1.5">
+                        <MessageSquare className="w-3.5 h-3.5 text-neonLime" />
+                        댓글 {totalComments}개
+                      </span>
+                      {isLoadingThisComments && (
+                        <span className="text-[10px] font-mono text-zinc-500 animate-pulse">
+                          동기화 중...
+                        </span>
+                      )}
+                    </div>
+
                     {/* Existing Comments */}
-                    {postComments.length > 0 && (
-                      <div className="space-y-2">
+                    {postComments.length > 0 ? (
+                      <div className="space-y-2 max-h-80 overflow-y-auto pr-1">
                         {postComments.map((c, idx) => (
                           <div
                             key={idx}
-                            className="p-3 rounded-xl bg-black/40 border border-white/5 text-xs space-y-1"
+                            className="p-3 rounded-xl bg-black/40 border border-white/5 text-xs space-y-1 hover:border-white/10 transition-colors"
                           >
                             <div className="flex items-center justify-between">
-                              <span className="font-bold text-white">{c.author}</span>
-                              <span className="text-[10px] text-zinc-500 font-mono">{c.time}</span>
+                              <div className="flex items-center gap-2">
+                                <div className="w-5 h-5 rounded-full bg-white/10 overflow-hidden relative border border-white/10 shrink-0">
+                                  {c.avatarUrl ? (
+                                    <Image
+                                      src={c.avatarUrl}
+                                      alt={c.author}
+                                      fill
+                                      className="object-cover"
+                                    />
+                                  ) : (
+                                    <User className="w-3 h-3 text-zinc-400 m-auto mt-1" />
+                                  )}
+                                </div>
+                                <span className="font-bold text-white">
+                                  {c.author}
+                                </span>
+                              </div>
+                              <span className="text-[10px] text-zinc-500 font-mono">
+                                {c.time}
+                              </span>
                             </div>
-                            <p className="text-zinc-300">{c.text}</p>
+                            <p className="text-zinc-300 pl-7 leading-relaxed whitespace-pre-wrap">
+                              {c.text}
+                            </p>
                           </div>
                         ))}
                       </div>
+                    ) : (
+                      <div className="p-4 rounded-xl bg-black/30 border border-dashed border-white/10 text-center">
+                        <p className="text-xs text-zinc-500">
+                          아직 작성된 댓글이 없습니다. 첫 번째 댓글을 남겨보세요!
+                        </p>
+                      </div>
                     )}
 
-                    {/* Add Comment Input */}
-                    <div className="flex gap-2">
-                      <input
-                        type="text"
-                        value={newCommentText[post.id] || ""}
-                        onChange={(e) =>
-                          setNewCommentText((prev) => ({
-                            ...prev,
-                            [post.id]: e.target.value,
-                          }))
-                        }
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") handleAddComment(post.id);
-                        }}
-                        placeholder="창작자에게 따뜻한 댓글을 남겨보세요..."
-                        className="flex-1 bg-black/60 border border-white/10 rounded-xl px-3 py-2 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-neonLime"
-                      />
-                      <button
-                        onClick={() => handleAddComment(post.id)}
-                        className="px-3.5 py-2 rounded-xl bg-neonLime text-black font-bold text-xs shadow-neon-sm hover:scale-105 transition-all"
-                      >
-                        등록
-                      </button>
+                    {/* Author Nickname Input & Comment Input */}
+                    <div className="space-y-2 pt-2 border-t border-white/5">
+                      <div className="flex items-center gap-2">
+                        <User className="w-3.5 h-3.5 text-neonLime shrink-0" />
+                        <input
+                          type="text"
+                          value={commentAuthorName}
+                          onChange={(e) => setCommentAuthorName(e.target.value)}
+                          placeholder="닉네임 (기본: 방문자 크리에이터)"
+                          maxLength={20}
+                          className="bg-black/40 border border-white/10 rounded-lg px-2.5 py-1 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-neonLime w-48"
+                        />
+                        <span className="text-[10px] text-zinc-500 font-mono hidden sm:inline">
+                          * 입력한 닉네임으로 댓글이 등록됩니다
+                        </span>
+                      </div>
+
+                      <div className="flex gap-2">
+                        <input
+                          type="text"
+                          value={newCommentText[post.id] || ""}
+                          onChange={(e) =>
+                            setNewCommentText((prev) => ({
+                              ...prev,
+                              [post.id]: e.target.value,
+                            }))
+                          }
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" && !e.shiftKey) {
+                              e.preventDefault();
+                              handleAddComment(post.id);
+                            }
+                          }}
+                          placeholder="창작자에게 따뜻한 피드백이나 댓글을 남겨보세요..."
+                          className="flex-1 bg-black/60 border border-white/10 rounded-xl px-3.5 py-2.5 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-neonLime"
+                        />
+                        <button
+                          onClick={() => handleAddComment(post.id)}
+                          disabled={submittingComment[post.id] || !newCommentText[post.id]?.trim()}
+                          className="px-4 py-2.5 rounded-xl bg-neonLime text-black font-bold text-xs shadow-neon-sm hover:scale-105 active:scale-95 disabled:opacity-50 disabled:hover:scale-100 transition-all flex items-center gap-1"
+                        >
+                          <Send className="w-3 h-3" />
+                          <span>등록</span>
+                        </button>
+                      </div>
                     </div>
                   </div>
                 )}
