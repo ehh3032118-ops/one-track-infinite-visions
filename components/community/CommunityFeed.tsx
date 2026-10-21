@@ -126,7 +126,7 @@ export default function CommunityFeed({
           const merged: CommentItem[] = [];
 
           for (const item of [...current, ...serverComments, ...localComments]) {
-            const key = `${item.author}::${item.text}`;
+            const key = `${(item.author || "").trim().toLowerCase()}::${(item.text || "").trim().toLowerCase()}`;
             if (!seen.has(key)) {
               seen.add(key);
               merged.push(item);
@@ -191,8 +191,12 @@ export default function CommunityFeed({
       localStorage.setItem("onetrack_nickname", commentAuthorName.trim());
     }
 
+    const commentId = `comment-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+    const nowIso = new Date().toISOString();
+
     // Optimistic UI update
     const optimisticComment: CommentItem = {
+      id: commentId,
       author: authorName,
       text,
       time: "방금 전",
@@ -201,18 +205,30 @@ export default function CommunityFeed({
     };
 
     setCommentsMap((prev) => {
-      const updatedList = [...(prev[postId] || []), optimisticComment];
+      const current = prev[postId] || [];
+      const seen = new Set<string>();
+      const updatedList: CommentItem[] = [];
+
+      for (const item of [...current, optimisticComment]) {
+        const key = `${item.author.trim().toLowerCase()}::${item.text.trim().toLowerCase()}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          updatedList.push(item);
+        }
+      }
+
       // Save to localStorage immediately
       if (typeof window !== "undefined") {
         try {
           const stored = localStorage.getItem("onetrack_custom_comments");
           const parsed = stored ? JSON.parse(stored) : {};
-          parsed[postId] = [...(parsed[postId] || []), optimisticComment];
+          parsed[postId] = updatedList;
           localStorage.setItem("onetrack_custom_comments", JSON.stringify(parsed));
         } catch (err) {
           console.warn("Failed to save comment to localStorage:", err);
         }
       }
+
       return {
         ...prev,
         [postId]: updatedList,
@@ -227,6 +243,7 @@ export default function CommunityFeed({
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          id: commentId,
           postId,
           text,
           author: {
@@ -234,6 +251,8 @@ export default function CommunityFeed({
             avatarUrl: optimisticComment.avatarUrl,
             role: "Creator Visitor",
           },
+          createdAt: nowIso,
+          timeAgo: "방금 전",
         }),
       });
 

@@ -23,7 +23,7 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { title, content, category, tags, author, thumbnailUrl } = body;
+    const { id, title, content, category, tags, author, thumbnailUrl, createdAt, timeAgo } = body;
 
     if (!title || !content) {
       return NextResponse.json(
@@ -33,6 +33,7 @@ export async function POST(request: NextRequest) {
     }
 
     const post = await createCommunityPost({
+      id: id ? String(id).trim() : undefined,
       title: title.trim(),
       content: content.trim(),
       category: category || "피드백 & 질문",
@@ -46,6 +47,8 @@ export async function POST(request: NextRequest) {
         verified: false,
       },
       thumbnailUrl: thumbnailUrl || undefined,
+      createdAt: createdAt || undefined,
+      timeAgo: timeAgo || undefined,
     });
 
     return NextResponse.json({ success: true, post });

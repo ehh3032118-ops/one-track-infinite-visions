@@ -29,7 +29,7 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { postId, text, author } = body;
+    const { postId, text, author, id, createdAt, timeAgo } = body;
 
     if (!postId || !text || !text.trim()) {
       return NextResponse.json(
@@ -41,7 +41,10 @@ export async function POST(request: NextRequest) {
     const comment = await addCommunityComment(
       postId,
       author || { name: "익명 크리에이터" },
-      text
+      text,
+      id ? String(id).trim() : undefined,
+      createdAt ? String(createdAt).trim() : undefined,
+      timeAgo ? String(timeAgo).trim() : undefined
     );
 
     return NextResponse.json({ success: true, comment });

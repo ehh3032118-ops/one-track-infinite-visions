@@ -57,12 +57,14 @@ const INITIAL_COMMENTS: Record<string, CommunityComment[]> = {
   ],
 };
 
-// Global in-memory cache for fallback
+// Global in-memory cache with timestamp to prevent thrashing and race conditions
 declare global {
   // eslint-disable-next-line no-var
   var __globalCommunityPosts: CommunityPost[] | undefined;
   // eslint-disable-next-line no-var
   var __globalCommunityComments: Record<string, CommunityComment[]> | undefined;
+  // eslint-disable-next-line no-var
+  var __globalCommunityLastFetched: number | undefined;
 }
 
 if (!global.__globalCommunityPosts) {
@@ -71,9 +73,76 @@ if (!global.__globalCommunityPosts) {
 if (!global.__globalCommunityComments) {
   global.__globalCommunityComments = { ...INITIAL_COMMENTS };
 }
+if (!global.__globalCommunityLastFetched) {
+  global.__globalCommunityLastFetched = 0;
+}
 
-// Helper: Fetch shared data from cloud database
-async function fetchFromCloudStore(): Promise<CloudStorePayload | null> {
+// Helper: Post unique content signature
+function getPostSig(p: CommunityPost): string {
+  const author = (p.author?.name || "").trim().toLowerCase();
+  const title = (p.title || "").trim().toLowerCase();
+  const contentSnippet = (p.content || "").trim().slice(0, 50).toLowerCase();
+  return `${author}::${title}::${contentSnippet}`;
+}
+
+// Helper: Comment unique content signature
+function getCommentSig(c: CommunityComment): string {
+  const author = (c.author?.name || "").trim().toLowerCase();
+  const text = (c.text || "").trim().toLowerCase();
+  return `${c.postId}::${author}::${text}`;
+}
+
+// Helper: Deduplicate post list by both ID and Content Signature
+function deduplicatePosts(posts: CommunityPost[]): CommunityPost[] {
+  const seenIds = new Set<string>();
+  const seenSigs = new Set<string>();
+  const result: CommunityPost[] = [];
+
+  for (const post of posts) {
+    if (!post || !post.id) continue;
+    const sig = getPostSig(post);
+    if (!seenIds.has(post.id) && !seenSigs.has(sig)) {
+      seenIds.add(post.id);
+      seenSigs.add(sig);
+      result.push(post);
+    }
+  }
+
+  // Sort newest first
+  result.sort((a, b) => {
+    const timeA = new Date(a.createdAt || 0).getTime();
+    const timeB = new Date(b.createdAt || 0).getTime();
+    return timeB - timeA;
+  });
+
+  return result;
+}
+
+// Serialized write queue to avoid race conditions when multiple users write simultaneously
+let writeQueue = Promise.resolve();
+function enqueueWrite<T>(fn: () => Promise<T>): Promise<T> {
+  const res = writeQueue.then(fn, fn);
+  writeQueue = res.then(() => {}, () => {});
+  return res;
+}
+
+// Helper: Fetch shared data from cloud database with short-lived cache
+async function fetchFromCloudStore(forceFresh: boolean = false): Promise<CloudStorePayload> {
+  const now = Date.now();
+  // Return in-memory cache if fresh (within 2 seconds) and not forced
+  if (
+    !forceFresh &&
+    global.__globalCommunityPosts &&
+    global.__globalCommunityPosts.length > 0 &&
+    global.__globalCommunityComments &&
+    now - (global.__globalCommunityLastFetched || 0) < 2000
+  ) {
+    return {
+      posts: global.__globalCommunityPosts,
+      comments: global.__globalCommunityComments,
+    };
+  }
+
   try {
     const res = await fetch(CLOUD_STORAGE_URL, {
       cache: "no-store",
@@ -82,28 +151,51 @@ async function fetchFromCloudStore(): Promise<CloudStorePayload | null> {
     if (res.ok) {
       const data = await res.json();
       if (data && Array.isArray(data.posts) && data.comments) {
-        return data as CloudStorePayload;
+        // Merge cloud data with any active in-memory cache so no in-flight posts are dropped
+        const mergedPosts = deduplicatePosts([...data.posts, ...(global.__globalCommunityPosts || [])]);
+        const mergedComments = { ...(global.__globalCommunityComments || INITIAL_COMMENTS), ...data.comments };
+
+        global.__globalCommunityPosts = mergedPosts;
+        global.__globalCommunityComments = mergedComments;
+        global.__globalCommunityLastFetched = now;
+
+        return { posts: mergedPosts, comments: mergedComments };
       }
     }
   } catch (err) {
-    console.warn("Cloud store fetch error, using local fallback:", err);
+    console.warn("Cloud store fetch error, using local fallback cache:", err);
   }
-  return null;
+
+  return {
+    posts: global.__globalCommunityPosts || [...COMMUNITY_POSTS],
+    comments: global.__globalCommunityComments || { ...INITIAL_COMMENTS },
+  };
 }
 
 // Helper: Update shared data to cloud database
 async function updateCloudStore(payload: CloudStorePayload): Promise<boolean> {
   try {
+    const cleanPayload: CloudStorePayload = {
+      posts: deduplicatePosts(payload.posts),
+      comments: payload.comments,
+    };
+
     const res = await fetch(CLOUD_STORAGE_URL, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(cleanPayload),
     });
-    return res.ok;
+
+    if (res.ok) {
+      global.__globalCommunityPosts = cleanPayload.posts;
+      global.__globalCommunityComments = cleanPayload.comments;
+      global.__globalCommunityLastFetched = Date.now();
+      return true;
+    }
   } catch (err) {
     console.warn("Cloud store update error:", err);
-    return false;
   }
+  return false;
 }
 
 export async function getCommunityPosts(category?: CommunityCategory): Promise<CommunityPost[]> {
@@ -146,40 +238,51 @@ export async function getCommunityPosts(category?: CommunityCategory): Promise<C
     }
   }
 
-  // 2. Multi-user shared cloud database
-  const cloudData = await fetchFromCloudStore();
-  if (cloudData && Array.isArray(cloudData.posts)) {
-    global.__globalCommunityPosts = cloudData.posts;
-    if (cloudData.comments) {
-      global.__globalCommunityComments = cloudData.comments;
-    }
-    if (!category || category === "전체") {
-      return cloudData.posts;
-    }
-    return cloudData.posts.filter((p) => p.category === category);
-  }
+  // 2. Multi-user shared cloud database (with memory cache fallback)
+  const cloudData = await fetchFromCloudStore(false);
+  const posts = cloudData.posts;
 
-  // 3. Fallback memory store
-  const allPosts = global.__globalCommunityPosts || COMMUNITY_POSTS;
   if (!category || category === "전체") {
-    return allPosts;
+    return posts;
   }
-  return allPosts.filter((p) => p.category === category);
+  return posts.filter((p) => p.category === category);
 }
 
 export async function createCommunityPost(
-  newPost: Omit<CommunityPost, "id" | "timeAgo" | "likes" | "comments" | "views" | "createdAt">
+  newPost: Partial<CommunityPost> & {
+    title: string;
+    content: string;
+    category?: CommunityCategory;
+    tags?: string[];
+    author?: { name: string; avatarUrl?: string; role?: string; verified?: boolean };
+    thumbnailUrl?: string;
+  }
 ): Promise<CommunityPost> {
-  const id = `post-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-  const now = new Date().toISOString();
+  const id = newPost.id && String(newPost.id).trim()
+    ? String(newPost.id).trim()
+    : `post-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+
+  const now = newPost.createdAt || new Date().toISOString();
 
   const post: CommunityPost = {
-    ...newPost,
     id,
-    timeAgo: "방금 전",
-    likes: 0,
-    comments: 0,
-    views: 1,
+    category: (newPost.category as CommunityCategory) || "피드백 & 질문",
+    author: {
+      name: newPost.author?.name || "방문자 크리에이터",
+      avatarUrl:
+        newPost.author?.avatarUrl ||
+        "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=200&q=80",
+      role: newPost.author?.role || "Visual Explorer",
+      verified: Boolean(newPost.author?.verified),
+    },
+    timeAgo: newPost.timeAgo || "방금 전",
+    title: newPost.title.trim(),
+    content: newPost.content.trim(),
+    tags: newPost.tags || ["#창작", "#커뮤니티"],
+    thumbnailUrl: newPost.thumbnailUrl || undefined,
+    likes: newPost.likes || 0,
+    comments: newPost.comments || 0,
+    views: newPost.views || 1,
     createdAt: now,
   };
 
@@ -209,23 +312,21 @@ export async function createCommunityPost(
     }
   }
 
-  // 2. Cloud store update
-  try {
-    const cloudData = (await fetchFromCloudStore()) || {
-      posts: [...(global.__globalCommunityPosts || COMMUNITY_POSTS)],
-      comments: { ...(global.__globalCommunityComments || INITIAL_COMMENTS) },
-    };
-    cloudData.posts = [post, ...cloudData.posts.filter((p) => p.id !== post.id)];
-    await updateCloudStore(cloudData);
-    global.__globalCommunityPosts = cloudData.posts;
-  } catch (err) {
-    console.warn("Failed to update cloud store for post:", err);
-  }
+  // 2. Serialized Cloud store update
+  await enqueueWrite(async () => {
+    try {
+      const cloudData = await fetchFromCloudStore(true);
+      const postSig = getPostSig(post);
 
-  // 3. Update memory
-  if (global.__globalCommunityPosts) {
-    global.__globalCommunityPosts = [post, ...global.__globalCommunityPosts.filter((p) => p.id !== post.id)];
-  }
+      // Filter out any duplicate with the same ID or same Content Signature
+      const filtered = cloudData.posts.filter((p) => p.id !== post.id && getPostSig(p) !== postSig);
+      cloudData.posts = [post, ...filtered];
+
+      await updateCloudStore(cloudData);
+    } catch (err) {
+      console.warn("Failed to update cloud store for post:", err);
+    }
+  });
 
   return post;
 }
@@ -260,23 +361,24 @@ export async function getCommunityComments(postId: string): Promise<CommunityCom
   }
 
   // 2. Cloud store fetch
-  const cloudData = await fetchFromCloudStore();
-  if (cloudData && cloudData.comments) {
-    return cloudData.comments[postId] || [];
-  }
-
-  // 3. Fallback memory store
-  const comments = global.__globalCommunityComments?.[postId] || [];
+  const cloudData = await fetchFromCloudStore(false);
+  const comments = cloudData.comments[postId] || [];
   return comments;
 }
 
 export async function addCommunityComment(
   postId: string,
   author: { name: string; avatarUrl?: string; role?: string },
-  text: string
+  text: string,
+  clientCommentId?: string,
+  clientCreatedAt?: string,
+  clientTimeAgo?: string
 ): Promise<CommunityComment> {
-  const id = `comment-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-  const now = new Date().toISOString();
+  const id = clientCommentId && String(clientCommentId).trim()
+    ? String(clientCommentId).trim()
+    : `comment-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+
+  const now = clientCreatedAt || new Date().toISOString();
 
   const comment: CommunityComment = {
     id,
@@ -289,7 +391,7 @@ export async function addCommunityComment(
       role: author.role || "Visual Explorer",
     },
     text: text.trim(),
-    timeAgo: "방금 전",
+    timeAgo: clientTimeAgo || "방금 전",
     createdAt: now,
   };
 
@@ -312,39 +414,28 @@ export async function addCommunityComment(
     }
   }
 
-  // 2. Cloud store update
-  try {
-    const cloudData = (await fetchFromCloudStore()) || {
-      posts: [...(global.__globalCommunityPosts || COMMUNITY_POSTS)],
-      comments: { ...(global.__globalCommunityComments || INITIAL_COMMENTS) },
-    };
-    const list = cloudData.comments[postId] || [];
-    cloudData.comments[postId] = [...list, comment];
+  // 2. Serialized Cloud store update
+  await enqueueWrite(async () => {
+    try {
+      const cloudData = await fetchFromCloudStore(true);
+      const list = cloudData.comments[postId] || [];
+      const commentSig = getCommentSig(comment);
 
-    // Increment comments count on post
-    const targetPost = cloudData.posts.find((p) => p.id === postId);
-    if (targetPost) {
-      targetPost.comments = (targetPost.comments || 0) + 1;
+      // Deduplicate comments
+      const filtered = list.filter((c) => c.id !== comment.id && getCommentSig(c) !== commentSig);
+      cloudData.comments[postId] = [...filtered, comment];
+
+      // Increment comments count on post
+      const targetPost = cloudData.posts.find((p) => p.id === postId);
+      if (targetPost) {
+        targetPost.comments = (cloudData.comments[postId] || []).length;
+      }
+
+      await updateCloudStore(cloudData);
+    } catch (err) {
+      console.warn("Failed to sync comment to cloud store:", err);
     }
-
-    await updateCloudStore(cloudData);
-    global.__globalCommunityComments = cloudData.comments;
-    global.__globalCommunityPosts = cloudData.posts;
-  } catch (err) {
-    console.warn("Failed to sync comment to cloud store:", err);
-  }
-
-  // 3. Update memory
-  if (global.__globalCommunityComments) {
-    const list = global.__globalCommunityComments[postId] || [];
-    global.__globalCommunityComments[postId] = [...list, comment];
-  }
-  if (global.__globalCommunityPosts) {
-    const targetPost = global.__globalCommunityPosts.find((p) => p.id === postId);
-    if (targetPost) {
-      targetPost.comments += 1;
-    }
-  }
+  });
 
   return comment;
 }
@@ -352,37 +443,21 @@ export async function addCommunityComment(
 export async function togglePostLike(postId: string): Promise<number> {
   let newLikes = 0;
 
-  // 1. Cloud store update
-  try {
-    const cloudData = (await fetchFromCloudStore()) || {
-      posts: [...(global.__globalCommunityPosts || COMMUNITY_POSTS)],
-      comments: { ...(global.__globalCommunityComments || INITIAL_COMMENTS) },
-    };
-    const targetPost = cloudData.posts.find((p) => p.id === postId);
-    if (targetPost) {
-      targetPost.likes = (targetPost.likes || 0) + 1;
-      newLikes = targetPost.likes;
-      await updateCloudStore(cloudData);
-      global.__globalCommunityPosts = cloudData.posts;
-    }
-  } catch (err) {
-    console.warn("Failed to sync like to cloud store:", err);
-  }
-
-  // 2. Memory store
-  if (global.__globalCommunityPosts) {
-    const targetPost = global.__globalCommunityPosts.find((p) => p.id === postId);
-    if (targetPost) {
-      if (newLikes === 0) {
-        targetPost.likes += 1;
+  await enqueueWrite(async () => {
+    try {
+      const cloudData = await fetchFromCloudStore(true);
+      const targetPost = cloudData.posts.find((p) => p.id === postId);
+      if (targetPost) {
+        targetPost.likes = (targetPost.likes || 0) + 1;
         newLikes = targetPost.likes;
-      } else {
-        targetPost.likes = newLikes;
+        await updateCloudStore(cloudData);
       }
+    } catch (err) {
+      console.warn("Failed to sync like to cloud store:", err);
     }
-  }
+  });
 
-  // 3. Supabase if configured
+  // Supabase if configured
   if (isSupabaseConfigured && supabase && newLikes > 0) {
     try {
       await supabase.rpc("increment_likes", { post_id: postId });

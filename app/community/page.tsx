@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useMemo } from "react";
 import Navbar from "@/components/common/Navbar";
 import Footer from "@/components/common/Footer";
 import CommunitySidebar from "@/components/community/CommunitySidebar";
@@ -10,6 +10,55 @@ import { COMMUNITY_POSTS } from "@/data/mockData";
 import { X, Sparkles, Send, User, Loader2 } from "lucide-react";
 
 const LOCAL_STORAGE_POSTS_KEY = "onetrack_custom_posts";
+
+// Helper: Post unique content signature
+function getPostSignature(p: CommunityPost): string {
+  const author = (p.author?.name || "").trim().toLowerCase();
+  const title = (p.title || "").trim().toLowerCase();
+  const content = (p.content || "").trim().slice(0, 50).toLowerCase();
+  return `${author}::${title}::${content}`;
+}
+
+// Helper: Merge and deduplicate by both ID and Content Signature
+function mergeAndDeduplicatePosts(
+  existingPosts: CommunityPost[],
+  incomingPosts: CommunityPost[]
+): CommunityPost[] {
+  const seenIds = new Set<string>();
+  const seenSignatures = new Set<string>();
+  const result: CommunityPost[] = [];
+
+  // Priority to incoming posts (freshest server state)
+  for (const post of incomingPosts) {
+    if (!post || !post.id) continue;
+    const sig = getPostSignature(post);
+    if (!seenIds.has(post.id) && !seenSignatures.has(sig)) {
+      seenIds.add(post.id);
+      seenSignatures.add(sig);
+      result.push(post);
+    }
+  }
+
+  // Then retain any existing/local posts that are not yet in incoming
+  for (const post of existingPosts) {
+    if (!post || !post.id) continue;
+    const sig = getPostSignature(post);
+    if (!seenIds.has(post.id) && !seenSignatures.has(sig)) {
+      seenIds.add(post.id);
+      seenSignatures.add(sig);
+      result.push(post);
+    }
+  }
+
+  // Sort newest first
+  result.sort((a, b) => {
+    const timeA = new Date(a.createdAt || 0).getTime();
+    const timeB = new Date(b.createdAt || 0).getTime();
+    return timeB - timeA;
+  });
+
+  return result;
+}
 
 const getStoredPosts = (): CommunityPost[] => {
   if (typeof window === "undefined") return [];
@@ -32,7 +81,7 @@ const saveStoredPosts = (newPosts: CommunityPost[]) => {
 
 export default function CommunityPage() {
   const [activeCategory, setActiveCategory] = useState<CommunityCategory>("전체");
-  const [posts, setPosts] = useState<CommunityPost[]>(COMMUNITY_POSTS);
+  const [allPosts, setAllPosts] = useState<CommunityPost[]>(COMMUNITY_POSTS);
   const [isModalOpen, setIsModalOpen] = useState<boolean>(false);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
 
@@ -45,7 +94,7 @@ export default function CommunityPage() {
     authorName: "",
   });
 
-  // Load saved nickname and local custom posts on mount
+  // Load saved nickname and local custom posts on initial mount
   useEffect(() => {
     if (typeof window !== "undefined") {
       const savedNickname = localStorage.getItem("onetrack_nickname");
@@ -55,62 +104,56 @@ export default function CommunityPage() {
 
       const localPosts = getStoredPosts();
       if (localPosts.length > 0) {
-        const seedIds = new Set(COMMUNITY_POSTS.map((p) => p.id));
-        const filtered = localPosts.filter((p) => !seedIds.has(p.id));
-        setPosts([...filtered, ...COMMUNITY_POSTS]);
+        setAllPosts((prev) => mergeAndDeduplicatePosts(prev, localPosts));
       }
     }
   }, []);
 
-  // Fetch posts from live API and merge with localStorage posts
+  // Fetch posts from live API and smoothly merge
   const fetchPosts = useCallback(async () => {
     try {
-      const query = activeCategory !== "전체" ? `?category=${encodeURIComponent(activeCategory)}` : "";
-      const res = await fetch(`/api/community/posts${query}`);
+      const res = await fetch("/api/community/posts");
       const data = await res.json();
 
-      const localCustomPosts = getStoredPosts();
-      let combined: CommunityPost[] = [];
-
       if (data.success && Array.isArray(data.posts)) {
-        const apiIds = new Set(data.posts.map((p: CommunityPost) => p.id));
-        const missingLocal = localCustomPosts.filter((p) => !apiIds.has(p.id));
-        combined = [...missingLocal, ...data.posts];
-      } else {
-        const seedIds = new Set(COMMUNITY_POSTS.map((p) => p.id));
-        const missingLocal = localCustomPosts.filter((p) => !seedIds.has(p.id));
-        combined = [...missingLocal, ...COMMUNITY_POSTS];
-      }
+        setAllPosts((prev) => {
+          const localPosts = getStoredPosts();
+          const merged = mergeAndDeduplicatePosts(prev, [...localPosts, ...data.posts]);
 
-      if (activeCategory !== "전체") {
-        combined = combined.filter((p) => p.category === activeCategory);
-      }
+          // Keep localStorage tidy with only user-created custom posts
+          const customOnly = merged.filter(
+            (p) => p.id !== "post-1" && p.id !== "post-2"
+          );
+          saveStoredPosts(customOnly);
 
-      setPosts(combined);
+          return merged;
+        });
+      }
     } catch (err) {
       console.warn("Failed to load community posts from API:", err);
-      const localCustomPosts = getStoredPosts();
-      const seedIds = new Set(COMMUNITY_POSTS.map((p) => p.id));
-      const missingLocal = localCustomPosts.filter((p) => !seedIds.has(p.id));
-      let combined = [...missingLocal, ...COMMUNITY_POSTS];
-      if (activeCategory !== "전체") {
-        combined = combined.filter((p) => p.category === activeCategory);
-      }
-      setPosts(combined);
     }
-  }, [activeCategory]);
+  }, []);
 
+  // Initial fetch
   useEffect(() => {
     fetchPosts();
   }, [fetchPosts]);
 
-  // Periodic background sync (every 15s) for live updates across visitors
+  // Real-time synchronization interval (every 8 seconds)
   useEffect(() => {
     const interval = setInterval(() => {
       fetchPosts();
-    }, 15000);
+    }, 8000);
     return () => clearInterval(interval);
   }, [fetchPosts]);
+
+  // Filter posts by category without wiping existing data
+  const filteredPosts = useMemo(() => {
+    if (activeCategory === "전체") {
+      return allPosts;
+    }
+    return allPosts.filter((p) => p.category === activeCategory);
+  }, [allPosts, activeCategory]);
 
   const handleCreatePost = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -128,8 +171,11 @@ export default function CommunityPage() {
       .filter(Boolean)
       .map((t) => (t.startsWith("#") ? t : `#${t}`));
 
+    const postId = `post-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+    const nowIso = new Date().toISOString();
+
     const localPost: CommunityPost = {
-      id: `post-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      id: postId,
       category: formData.category,
       author: {
         name: authorName,
@@ -145,13 +191,17 @@ export default function CommunityPage() {
       likes: 0,
       comments: 0,
       views: 1,
-      createdAt: new Date().toISOString(),
+      createdAt: nowIso,
     };
 
-    // Save to localStorage immediately so it never disappears on refresh
-    const existingLocal = getStoredPosts();
-    saveStoredPosts([localPost, ...existingLocal]);
-    setPosts((prev) => [localPost, ...prev]);
+    // 1. Optimistic UI update: Deduplicate and prepend
+    setAllPosts((prev) => mergeAndDeduplicatePosts(prev, [localPost]));
+
+    // 2. Persist in local storage
+    const currentStored = getStoredPosts();
+    saveStoredPosts(mergeAndDeduplicatePosts(currentStored, [localPost]));
+
+    // 3. Reset form and close modal
     setIsModalOpen(false);
     setFormData((prev) => ({
       ...prev,
@@ -161,14 +211,19 @@ export default function CommunityPage() {
       tags: "",
     }));
 
+    // 4. Send to server API with the exact same ID and timestamp
     try {
-      await fetch("/api/community/posts", {
+      const res = await fetch("/api/community/posts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(localPost),
       });
+      const data = await res.json();
+      if (data.success && data.post) {
+        setAllPosts((prev) => mergeAndDeduplicatePosts(prev, [data.post]));
+      }
     } catch (err) {
-      console.warn("Server sync error (post preserved in localStorage):", err);
+      console.warn("Server sync notice (post saved locally):", err);
     } finally {
       setIsSubmitting(false);
     }
@@ -196,7 +251,7 @@ export default function CommunityPage() {
             {/* Right Column: Community Feed List */}
             <div className="lg:col-span-8 xl:col-span-9">
               <CommunityFeed
-                posts={posts}
+                posts={filteredPosts}
                 activeCategory={activeCategory}
                 onPostUpdated={fetchPosts}
               />
