@@ -2,6 +2,14 @@ import { CommunityPost, CommunityComment, CommunityCategory } from "@/types";
 import { COMMUNITY_POSTS } from "@/data/mockData";
 import { supabase, isSupabaseConfigured } from "./supabase";
 
+// Global cloud-hosted JSON DB (active out-of-the-box for all visitors across devices)
+const CLOUD_STORAGE_URL = "https://extendsclass.com/api/json-storage/bin/eadffdf";
+
+interface CloudStorePayload {
+  posts: CommunityPost[];
+  comments: Record<string, CommunityComment[]>;
+}
+
 // Initial seed comments
 const INITIAL_COMMENTS: Record<string, CommunityComment[]> = {
   "post-1": [
@@ -49,7 +57,7 @@ const INITIAL_COMMENTS: Record<string, CommunityComment[]> = {
   ],
 };
 
-// Global in-memory cache for fallback when Supabase is not yet linked
+// Global in-memory cache for fallback
 declare global {
   // eslint-disable-next-line no-var
   var __globalCommunityPosts: CommunityPost[] | undefined;
@@ -64,7 +72,42 @@ if (!global.__globalCommunityComments) {
   global.__globalCommunityComments = { ...INITIAL_COMMENTS };
 }
 
+// Helper: Fetch shared data from cloud database
+async function fetchFromCloudStore(): Promise<CloudStorePayload | null> {
+  try {
+    const res = await fetch(CLOUD_STORAGE_URL, {
+      cache: "no-store",
+      headers: { Accept: "application/json" },
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data && Array.isArray(data.posts) && data.comments) {
+        return data as CloudStorePayload;
+      }
+    }
+  } catch (err) {
+    console.warn("Cloud store fetch error, using local fallback:", err);
+  }
+  return null;
+}
+
+// Helper: Update shared data to cloud database
+async function updateCloudStore(payload: CloudStorePayload): Promise<boolean> {
+  try {
+    const res = await fetch(CLOUD_STORAGE_URL, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    return res.ok;
+  } catch (err) {
+    console.warn("Cloud store update error:", err);
+    return false;
+  }
+}
+
 export async function getCommunityPosts(category?: CommunityCategory): Promise<CommunityPost[]> {
+  // 1. If Supabase is configured, use Supabase
   if (isSupabaseConfigured && supabase) {
     try {
       let query = supabase
@@ -99,11 +142,24 @@ export async function getCommunityPosts(category?: CommunityCategory): Promise<C
         }));
       }
     } catch (e) {
-      console.warn("Supabase posts fetch failed, falling back to local memory store:", e);
+      console.warn("Supabase posts fetch failed, falling back to cloud store:", e);
     }
   }
 
-  // Fallback memory store
+  // 2. Multi-user shared cloud database
+  const cloudData = await fetchFromCloudStore();
+  if (cloudData && Array.isArray(cloudData.posts)) {
+    global.__globalCommunityPosts = cloudData.posts;
+    if (cloudData.comments) {
+      global.__globalCommunityComments = cloudData.comments;
+    }
+    if (!category || category === "전체") {
+      return cloudData.posts;
+    }
+    return cloudData.posts.filter((p) => p.category === category);
+  }
+
+  // 3. Fallback memory store
   const allPosts = global.__globalCommunityPosts || COMMUNITY_POSTS;
   if (!category || category === "전체") {
     return allPosts;
@@ -127,9 +183,10 @@ export async function createCommunityPost(
     createdAt: now,
   };
 
+  // 1. Supabase if configured
   if (isSupabaseConfigured && supabase) {
     try {
-      const { error } = await supabase.from("posts").insert([
+      await supabase.from("posts").insert([
         {
           id,
           category: post.category,
@@ -147,23 +204,34 @@ export async function createCommunityPost(
           created_at: now,
         },
       ]);
-      if (error) {
-        console.error("Supabase post insert error:", error);
-      }
     } catch (e) {
-      console.warn("Supabase post insert failed, using memory store:", e);
+      console.warn("Supabase post insert failed:", e);
     }
   }
 
-  // Always update in-memory cache as well
+  // 2. Cloud store update
+  try {
+    const cloudData = (await fetchFromCloudStore()) || {
+      posts: [...(global.__globalCommunityPosts || COMMUNITY_POSTS)],
+      comments: { ...(global.__globalCommunityComments || INITIAL_COMMENTS) },
+    };
+    cloudData.posts = [post, ...cloudData.posts.filter((p) => p.id !== post.id)];
+    await updateCloudStore(cloudData);
+    global.__globalCommunityPosts = cloudData.posts;
+  } catch (err) {
+    console.warn("Failed to update cloud store for post:", err);
+  }
+
+  // 3. Update memory
   if (global.__globalCommunityPosts) {
-    global.__globalCommunityPosts = [post, ...global.__globalCommunityPosts];
+    global.__globalCommunityPosts = [post, ...global.__globalCommunityPosts.filter((p) => p.id !== post.id)];
   }
 
   return post;
 }
 
 export async function getCommunityComments(postId: string): Promise<CommunityComment[]> {
+  // 1. Supabase if configured
   if (isSupabaseConfigured && supabase) {
     try {
       const { data, error } = await supabase
@@ -187,11 +255,17 @@ export async function getCommunityComments(postId: string): Promise<CommunityCom
         }));
       }
     } catch (e) {
-      console.warn("Supabase comments fetch failed, using memory store:", e);
+      console.warn("Supabase comments fetch failed:", e);
     }
   }
 
-  // Fallback memory store
+  // 2. Cloud store fetch
+  const cloudData = await fetchFromCloudStore();
+  if (cloudData && cloudData.comments) {
+    return cloudData.comments[postId] || [];
+  }
+
+  // 3. Fallback memory store
   const comments = global.__globalCommunityComments?.[postId] || [];
   return comments;
 }
@@ -219,9 +293,10 @@ export async function addCommunityComment(
     createdAt: now,
   };
 
+  // 1. Supabase if configured
   if (isSupabaseConfigured && supabase) {
     try {
-      const { error } = await supabase.from("comments").insert([
+      await supabase.from("comments").insert([
         {
           id,
           post_id: postId,
@@ -232,21 +307,38 @@ export async function addCommunityComment(
           created_at: now,
         },
       ]);
-      if (error) {
-        console.error("Supabase comment insert error:", error);
-      }
     } catch (e) {
-      console.warn("Supabase comment insert failed, using memory store:", e);
+      console.warn("Supabase comment insert failed:", e);
     }
   }
 
-  // Update in-memory comments
+  // 2. Cloud store update
+  try {
+    const cloudData = (await fetchFromCloudStore()) || {
+      posts: [...(global.__globalCommunityPosts || COMMUNITY_POSTS)],
+      comments: { ...(global.__globalCommunityComments || INITIAL_COMMENTS) },
+    };
+    const list = cloudData.comments[postId] || [];
+    cloudData.comments[postId] = [...list, comment];
+
+    // Increment comments count on post
+    const targetPost = cloudData.posts.find((p) => p.id === postId);
+    if (targetPost) {
+      targetPost.comments = (targetPost.comments || 0) + 1;
+    }
+
+    await updateCloudStore(cloudData);
+    global.__globalCommunityComments = cloudData.comments;
+    global.__globalCommunityPosts = cloudData.posts;
+  } catch (err) {
+    console.warn("Failed to sync comment to cloud store:", err);
+  }
+
+  // 3. Update memory
   if (global.__globalCommunityComments) {
     const list = global.__globalCommunityComments[postId] || [];
     global.__globalCommunityComments[postId] = [...list, comment];
   }
-
-  // Increment comment count on post
   if (global.__globalCommunityPosts) {
     const targetPost = global.__globalCommunityPosts.find((p) => p.id === postId);
     if (targetPost) {
@@ -260,14 +352,37 @@ export async function addCommunityComment(
 export async function togglePostLike(postId: string): Promise<number> {
   let newLikes = 0;
 
+  // 1. Cloud store update
+  try {
+    const cloudData = (await fetchFromCloudStore()) || {
+      posts: [...(global.__globalCommunityPosts || COMMUNITY_POSTS)],
+      comments: { ...(global.__globalCommunityComments || INITIAL_COMMENTS) },
+    };
+    const targetPost = cloudData.posts.find((p) => p.id === postId);
+    if (targetPost) {
+      targetPost.likes = (targetPost.likes || 0) + 1;
+      newLikes = targetPost.likes;
+      await updateCloudStore(cloudData);
+      global.__globalCommunityPosts = cloudData.posts;
+    }
+  } catch (err) {
+    console.warn("Failed to sync like to cloud store:", err);
+  }
+
+  // 2. Memory store
   if (global.__globalCommunityPosts) {
     const targetPost = global.__globalCommunityPosts.find((p) => p.id === postId);
     if (targetPost) {
-      targetPost.likes += 1;
-      newLikes = targetPost.likes;
+      if (newLikes === 0) {
+        targetPost.likes += 1;
+        newLikes = targetPost.likes;
+      } else {
+        targetPost.likes = newLikes;
+      }
     }
   }
 
+  // 3. Supabase if configured
   if (isSupabaseConfigured && supabase && newLikes > 0) {
     try {
       await supabase.rpc("increment_likes", { post_id: postId });
