@@ -56,12 +56,36 @@ export default function CommunityFeed({
     ],
   });
 
-  // Load saved nickname from localStorage if available
+  // Load saved nickname, custom comments, and likes from localStorage
   useEffect(() => {
     if (typeof window !== "undefined") {
       const saved = localStorage.getItem("onetrack_nickname");
       if (saved) {
         setCommentAuthorName(saved);
+      }
+
+      try {
+        const storedLikes = localStorage.getItem("onetrack_liked_posts");
+        if (storedLikes) {
+          setLikedPosts(JSON.parse(storedLikes));
+        }
+
+        const storedComments = localStorage.getItem("onetrack_custom_comments");
+        if (storedComments) {
+          const parsed = JSON.parse(storedComments) as Record<string, CommentItem[]>;
+          setCommentsMap((prev) => {
+            const merged = { ...prev };
+            for (const [postId, list] of Object.entries(parsed)) {
+              const existing = merged[postId] || [];
+              const seen = new Set(existing.map((c) => `${c.author}::${c.text}`));
+              const uniqueNew = list.filter((c) => !seen.has(`${c.author}::${c.text}`));
+              merged[postId] = [...existing, ...uniqueNew];
+            }
+            return merged;
+          });
+        }
+      } catch (e) {
+        console.warn("Failed to parse localStorage comments/likes:", e);
       }
     }
   }, []);
@@ -71,17 +95,46 @@ export default function CommunityFeed({
       setLoadingComments((prev) => ({ ...prev, [postId]: true }));
       const res = await fetch(`/api/community/comments?postId=${postId}`);
       const data = await res.json();
+
+      let localComments: CommentItem[] = [];
+      if (typeof window !== "undefined") {
+        try {
+          const stored = localStorage.getItem("onetrack_custom_comments");
+          if (stored) {
+            const parsed = JSON.parse(stored);
+            localComments = parsed[postId] || [];
+          }
+        } catch {
+          // ignore
+        }
+      }
+
       if (data.success && Array.isArray(data.comments)) {
-        setCommentsMap((prev) => ({
-          ...prev,
-          [postId]: data.comments.map((c: { author?: { name?: string; avatarUrl?: string }; text: string; timeAgo?: string }) => ({
+        const serverComments: CommentItem[] = data.comments.map(
+          (c: { author?: { name?: string; avatarUrl?: string }; text: string; timeAgo?: string }) => ({
             id: c.timeAgo,
             author: c.author?.name || "익명 크리에이터",
             avatarUrl: c.author?.avatarUrl,
             text: c.text,
             time: c.timeAgo || "방금 전",
-          })),
-        }));
+          })
+        );
+
+        setCommentsMap((prev) => {
+          const current = prev[postId] || [];
+          const seen = new Set<string>();
+          const merged: CommentItem[] = [];
+
+          for (const item of [...current, ...serverComments, ...localComments]) {
+            const key = `${item.author}::${item.text}`;
+            if (!seen.has(key)) {
+              seen.add(key);
+              merged.push(item);
+            }
+          }
+
+          return { ...prev, [postId]: merged };
+        });
       }
     } catch (e) {
       console.warn("Failed to fetch comments for post:", postId, e);
@@ -102,7 +155,16 @@ export default function CommunityFeed({
 
   const toggleLike = async (postId: string) => {
     const isCurrentlyLiked = likedPosts[postId];
-    setLikedPosts((prev) => ({ ...prev, [postId]: !isCurrentlyLiked }));
+    const nextState = !isCurrentlyLiked;
+    setLikedPosts((prev) => {
+      const updated = { ...prev, [postId]: nextState };
+      if (typeof window !== "undefined") {
+        try {
+          localStorage.setItem("onetrack_liked_posts", JSON.stringify(updated));
+        } catch {}
+      }
+      return updated;
+    });
     setLikesCountDelta((prev) => ({
       ...prev,
       [postId]: (prev[postId] || 0) + (isCurrentlyLiked ? -1 : 1),
@@ -138,10 +200,24 @@ export default function CommunityFeed({
         "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=200&q=80",
     };
 
-    setCommentsMap((prev) => ({
-      ...prev,
-      [postId]: [...(prev[postId] || []), optimisticComment],
-    }));
+    setCommentsMap((prev) => {
+      const updatedList = [...(prev[postId] || []), optimisticComment];
+      // Save to localStorage immediately
+      if (typeof window !== "undefined") {
+        try {
+          const stored = localStorage.getItem("onetrack_custom_comments");
+          const parsed = stored ? JSON.parse(stored) : {};
+          parsed[postId] = [...(parsed[postId] || []), optimisticComment];
+          localStorage.setItem("onetrack_custom_comments", JSON.stringify(parsed));
+        } catch (err) {
+          console.warn("Failed to save comment to localStorage:", err);
+        }
+      }
+      return {
+        ...prev,
+        [postId]: updatedList,
+      };
+    });
 
     setNewCommentText((prev) => ({ ...prev, [postId]: "" }));
     setSubmittingComment((prev) => ({ ...prev, [postId]: true }));

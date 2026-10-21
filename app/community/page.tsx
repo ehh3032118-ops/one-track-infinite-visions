@@ -9,6 +9,27 @@ import { CommunityCategory, CommunityPost } from "@/types";
 import { COMMUNITY_POSTS } from "@/data/mockData";
 import { X, Sparkles, Send, User, Loader2 } from "lucide-react";
 
+const LOCAL_STORAGE_POSTS_KEY = "onetrack_custom_posts";
+
+const getStoredPosts = (): CommunityPost[] => {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(LOCAL_STORAGE_POSTS_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+};
+
+const saveStoredPosts = (newPosts: CommunityPost[]) => {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.setItem(LOCAL_STORAGE_POSTS_KEY, JSON.stringify(newPosts));
+  } catch (e) {
+    console.warn("Failed to save posts to localStorage", e);
+  }
+};
+
 export default function CommunityPage() {
   const [activeCategory, setActiveCategory] = useState<CommunityCategory>("전체");
   const [posts, setPosts] = useState<CommunityPost[]>(COMMUNITY_POSTS);
@@ -24,27 +45,58 @@ export default function CommunityPage() {
     authorName: "",
   });
 
-  // Load saved nickname from localStorage
+  // Load saved nickname and local custom posts on mount
   useEffect(() => {
     if (typeof window !== "undefined") {
       const savedNickname = localStorage.getItem("onetrack_nickname");
       if (savedNickname) {
         setFormData((prev) => ({ ...prev, authorName: savedNickname }));
       }
+
+      const localPosts = getStoredPosts();
+      if (localPosts.length > 0) {
+        const seedIds = new Set(COMMUNITY_POSTS.map((p) => p.id));
+        const filtered = localPosts.filter((p) => !seedIds.has(p.id));
+        setPosts([...filtered, ...COMMUNITY_POSTS]);
+      }
     }
   }, []);
 
-  // Fetch posts from live API
+  // Fetch posts from live API and merge with localStorage posts
   const fetchPosts = useCallback(async () => {
     try {
       const query = activeCategory !== "전체" ? `?category=${encodeURIComponent(activeCategory)}` : "";
       const res = await fetch(`/api/community/posts${query}`);
       const data = await res.json();
+
+      const localCustomPosts = getStoredPosts();
+      let combined: CommunityPost[] = [];
+
       if (data.success && Array.isArray(data.posts)) {
-        setPosts(data.posts);
+        const apiIds = new Set(data.posts.map((p: CommunityPost) => p.id));
+        const missingLocal = localCustomPosts.filter((p) => !apiIds.has(p.id));
+        combined = [...missingLocal, ...data.posts];
+      } else {
+        const seedIds = new Set(COMMUNITY_POSTS.map((p) => p.id));
+        const missingLocal = localCustomPosts.filter((p) => !seedIds.has(p.id));
+        combined = [...missingLocal, ...COMMUNITY_POSTS];
       }
+
+      if (activeCategory !== "전체") {
+        combined = combined.filter((p) => p.category === activeCategory);
+      }
+
+      setPosts(combined);
     } catch (err) {
       console.warn("Failed to load community posts from API:", err);
+      const localCustomPosts = getStoredPosts();
+      const seedIds = new Set(COMMUNITY_POSTS.map((p) => p.id));
+      const missingLocal = localCustomPosts.filter((p) => !seedIds.has(p.id));
+      let combined = [...missingLocal, ...COMMUNITY_POSTS];
+      if (activeCategory !== "전체") {
+        combined = combined.filter((p) => p.category === activeCategory);
+      }
+      setPosts(combined);
     }
   }, [activeCategory]);
 
@@ -76,38 +128,47 @@ export default function CommunityPage() {
       .filter(Boolean)
       .map((t) => (t.startsWith("#") ? t : `#${t}`));
 
+    const localPost: CommunityPost = {
+      id: `post-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      category: formData.category,
+      author: {
+        name: authorName,
+        avatarUrl:
+          "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=200&q=80",
+        role: "Visual Creator",
+        verified: false,
+      },
+      timeAgo: "방금 전",
+      title: formData.title.trim(),
+      content: formData.content.trim(),
+      tags: parsedTags.length > 0 ? parsedTags : ["#창작", "#커뮤니티"],
+      likes: 0,
+      comments: 0,
+      views: 1,
+      createdAt: new Date().toISOString(),
+    };
+
+    // Save to localStorage immediately so it never disappears on refresh
+    const existingLocal = getStoredPosts();
+    saveStoredPosts([localPost, ...existingLocal]);
+    setPosts((prev) => [localPost, ...prev]);
+    setIsModalOpen(false);
+    setFormData((prev) => ({
+      ...prev,
+      title: "",
+      content: "",
+      category: "피드백 & 질문",
+      tags: "",
+    }));
+
     try {
-      const res = await fetch("/api/community/posts", {
+      await fetch("/api/community/posts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          title: formData.title.trim(),
-          content: formData.content.trim(),
-          category: formData.category,
-          tags: parsedTags.length > 0 ? parsedTags : ["#창작", "#커뮤니티"],
-          author: {
-            name: authorName,
-            avatarUrl:
-              "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=200&q=80",
-            role: "Visual Creator",
-          },
-        }),
+        body: JSON.stringify(localPost),
       });
-
-      const data = await res.json();
-      if (data.success && data.post) {
-        setPosts((prev) => [data.post, ...prev]);
-        setIsModalOpen(false);
-        setFormData((prev) => ({
-          ...prev,
-          title: "",
-          content: "",
-          category: "피드백 & 질문",
-          tags: "",
-        }));
-      }
     } catch (err) {
-      console.error("Failed to post:", err);
+      console.warn("Server sync error (post preserved in localStorage):", err);
     } finally {
       setIsSubmitting(false);
     }
